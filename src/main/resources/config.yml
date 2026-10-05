@@ -1,0 +1,49 @@
+# MeowLogIn configuration file
+# All boolean values: true = enabled, false = disabled
+
+# Default language for players who haven't chosen one.
+# Available: any code from the lang/ folder (ru, en, ...)
+default-language: en
+
+# Spawn mode for joining players:
+#   DEFAULT - player stays where they logged out
+#   FIXED   - player is teleported to spawn-location until authenticated
+spawn-mode: DEFAULT
+
+# Coordinates used when spawn-mode is FIXED.
+spawn-location:
+  world: world
+  x: 0.0
+  y: 64.0
+  z: 0.0
+  yaw: 0.0
+  pitch: 0.0
+
+# Seconds before unauthenticated player is kicked. Set to 0 to disable.
+auth-timeout: 120
+
+# If true, player must link Telegram before they can play (after auth).
+# Default: false
+require-telegram-link: false
+
+# What to block for unauthenticated players.
+block:
+  movement: true
+  chat: true
+  commands: true
+  item-drop: true
+  item-pickup: true
+  block-break: true
+  block-place: true
+  damage: true
+  mob-target: true
+  gamemode-change: true
+  flight: true
+  interact: true
+  interact-entity: true
+
+# Telegram bot settings.
+telegram:
+  enabled: false
+  token: ""
+  bot-username: ""

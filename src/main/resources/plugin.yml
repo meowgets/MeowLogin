@@ -1,0 +1,35 @@
+name: MeowLogIn
+version: 1.0
+main: com.meowgets.btc.MeowLogIn
+api-version: '26.2'
+author: MeowGets
+description: Custom authentication with dialog GUI and chat fallback
+commands:
+  meowlogin:
+    description: Authentication help or mode switch
+    usage: /meowlogin [mode|lang|reload|reset]
+    aliases: [ml]
+  ml:
+    description: Authentication help or mode switch
+    usage: /ml [mode|lang|reload|reset]
+  login:
+    description: Login to the server
+    usage: /login <password>
+    aliases: [l]
+  register:
+    description: Register on the server
+    usage: /register <password> <password>
+    aliases: [reg]
+  resetpassword:
+    description: Request password reset via Telegram
+    usage: /resetpassword
+  link:
+    description: Link your Telegram account
+    usage: /link
+  unlink:
+    description: Unlink your Telegram account
+    usage: /unlink
+  unreg:
+    description: Unregister a player (admin only)
+    usage: /unreg <player>
+    permission: meowlogin.unreg
