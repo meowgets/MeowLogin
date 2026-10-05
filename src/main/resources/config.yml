@@ -47,3 +47,10 @@ telegram:
   enabled: false
   token: ""
   bot-username: ""
+
+  # Minimum password length. Applied on register and on password change.
+  min-password-length: 4
+
+  # How often to show the "link Telegram" hint.
+  # 0 = never, 1 = every join, 3 = every 3rd join.
+  telegram-hint-every: 3

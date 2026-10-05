@@ -17,7 +17,6 @@ repositories {
 dependencies {
     compileOnly("io.papermc.paper:paper-api:26.2.build.+")
 
-    // TelegramBots для лонг-поллинга
     implementation("org.telegram:telegrambots-longpolling:7.10.0")
     implementation("org.telegram:telegrambots-client:7.10.0")
 }
@@ -29,7 +28,6 @@ java {
 tasks {
     shadowJar {
         archiveClassifier.set("")
-        // Релокация, чтобы не конфликтовать с другими плагинами
         relocate("org.telegram", "com.meowgets.btc.telegram")
     }
     build {

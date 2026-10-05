@@ -38,23 +38,41 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
-import java.sql.*;
-import java.util.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.text.SimpleDateFormat;
 import java.util.Base64;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 
 public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     private Connection connection;
     private final Map<UUID, BukkitTask> kickTasks = new HashMap<>();
     private final Map<UUID, Boolean> authenticated = new HashMap<>();
+    private final Map<UUID, Boolean> inGame = new HashMap<>();
     private final Map<UUID, Location> preAuthLocations = new HashMap<>();
     private final Map<UUID, String> playerLanguages = new HashMap<>();
     private final Map<String, UUID> linkCodes = new HashMap<>();
-    private final Set<UUID> telegramHintShown = new HashSet<>();
+    private final Map<String, Long> linkCodeExpiry = new HashMap<>();
 
     private final Map<String, Map<String, String>> languages = new HashMap<>();
     private final Map<String, String> languageNames = new HashMap<>();
@@ -62,10 +80,14 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
 
     private String defaultLang = "en";
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static final long LINK_CODE_TTL_MS = 10 * 60 * 1000L;
 
     private Set<String> allowedKeys = new HashSet<>();
 
     private TelegramBot telegramBot;
+
+    private File logFile;
+    private final SimpleDateFormat logDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 
     @Override
     public void onEnable() {
@@ -73,6 +95,10 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         defaultLang = getConfig().getString("default-language", "en");
         connectDatabase();
         loadAllLanguages();
+
+        if (!getDataFolder().exists()) getDataFolder().mkdirs();
+        logFile = new File(getDataFolder(), "meowlogin.log");
+
         getServer().getPluginManager().registerEvents(this, this);
 
         if (getCommand("meowlogin") != null) {
@@ -83,21 +109,11 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
             getCommand("ml").setExecutor(this);
             getCommand("ml").setTabCompleter(this);
         }
-        if (getCommand("login") != null) {
-            getCommand("login").setExecutor(this);
-        }
-        if (getCommand("register") != null) {
-            getCommand("register").setExecutor(this);
-        }
-        if (getCommand("resetpassword") != null) {
-            getCommand("resetpassword").setExecutor(this);
-        }
-        if (getCommand("link") != null) {
-            getCommand("link").setExecutor(this);
-        }
-        if (getCommand("unlink") != null) {
-            getCommand("unlink").setExecutor(this);
-        }
+        if (getCommand("login") != null) getCommand("login").setExecutor(this);
+        if (getCommand("register") != null) getCommand("register").setExecutor(this);
+        if (getCommand("resetpassword") != null) getCommand("resetpassword").setExecutor(this);
+        if (getCommand("link") != null) getCommand("link").setExecutor(this);
+        if (getCommand("unlink") != null) getCommand("unlink").setExecutor(this);
         if (getCommand("unreg") != null) {
             getCommand("unreg").setExecutor(this);
             getCommand("unreg").setTabCompleter(this);
@@ -117,9 +133,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
 
     @Override
     public void onDisable() {
-        if (telegramBot != null) {
-            telegramBot.shutdown();
-        }
+        if (telegramBot != null) telegramBot.shutdown();
         try {
             if (connection != null && !connection.isClosed()) connection.close();
         } catch (SQLException e) {
@@ -132,15 +146,35 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         return telegramBot;
     }
 
-    // ========== БАЗА ==========
+    public void log(String message) {
+        String line = "[" + logDateFormat.format(new Date()) + "] " + message;
+        getLogger().info("[AUDIT] " + message);
+        if (logFile == null) return;
+        try (PrintWriter pw = new PrintWriter(new FileWriter(logFile, true))) {
+            pw.println(line);
+        } catch (IOException e) {
+            getLogger().warning("Failed to write audit log: " + e.getMessage());
+        }
+    }
+
     private void connectDatabase() {
         try {
             if (!getDataFolder().exists()) getDataFolder().mkdirs();
             File dbFile = new File(getDataFolder(), "users.db");
             connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
             try (Statement stmt = connection.createStatement()) {
-                stmt.execute("CREATE TABLE IF NOT EXISTS users (uuid TEXT PRIMARY KEY, password_hash TEXT NOT NULL, salt TEXT NOT NULL, auth_mode TEXT NOT NULL DEFAULT 'DIALOG')");
-                stmt.execute("CREATE TABLE IF NOT EXISTS telegram_links (uuid TEXT PRIMARY KEY, chat_id INTEGER NOT NULL)");
+                stmt.execute("CREATE TABLE IF NOT EXISTS users (" +
+                        "uuid TEXT PRIMARY KEY, " +
+                        "password_hash TEXT NOT NULL, " +
+                        "salt TEXT NOT NULL, " +
+                        "auth_mode TEXT NOT NULL DEFAULT 'DIALOG', " +
+                        "join_count INTEGER NOT NULL DEFAULT 0)");
+                stmt.execute("CREATE TABLE IF NOT EXISTS telegram_links (" +
+                        "uuid TEXT PRIMARY KEY, " +
+                        "chat_id INTEGER NOT NULL UNIQUE)");
+                try {
+                    stmt.execute("ALTER TABLE users ADD COLUMN join_count INTEGER NOT NULL DEFAULT 0");
+                } catch (SQLException ignored) { }
                 stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tg_chat ON telegram_links(chat_id)");
             }
             getLogger().info("Database connected.");
@@ -156,12 +190,9 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         } catch (SQLException e) { return false; }
     }
 
-    public boolean isRegisteredPublic(UUID uuid) {
-        return isRegistered(uuid);
-    }
-
     private void registerUser(UUID uuid, String hash, String salt, String mode) {
-        try (PreparedStatement ps = connection.prepareStatement("INSERT INTO users (uuid, password_hash, salt, auth_mode) VALUES (?, ?, ?, ?)")) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO users (uuid, password_hash, salt, auth_mode, join_count) VALUES (?, ?, ?, ?, 0)")) {
             ps.setString(1, uuid.toString());
             ps.setString(2, hash);
             ps.setString(3, salt);
@@ -171,7 +202,8 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     }
 
     private void updatePassword(UUID uuid, String hash, String salt) {
-        try (PreparedStatement ps = connection.prepareStatement("UPDATE users SET password_hash = ?, salt = ? WHERE uuid = ?")) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE users SET password_hash = ?, salt = ? WHERE uuid = ?")) {
             ps.setString(1, hash);
             ps.setString(2, salt);
             ps.setString(3, uuid.toString());
@@ -208,18 +240,29 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         } catch (SQLException e) { getLogger().severe("SetAuthMode error: " + e.getMessage()); }
     }
 
-    // ========== TELEGRAM LINKS ==========
+    private int getJoinCount(UUID uuid) {
+        try (PreparedStatement ps = connection.prepareStatement("SELECT join_count FROM users WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) { return rs.next() ? rs.getInt("join_count") : 0; }
+        } catch (SQLException e) { return 0; }
+    }
+
+    private void incrementJoinCount(UUID uuid) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE users SET join_count = join_count + 1 WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            ps.executeUpdate();
+        } catch (SQLException ignored) { }
+    }
+
     private void saveTelegramLink(UUID uuid, long chatId) {
         try {
-            try (PreparedStatement del = connection.prepareStatement(
-                    "DELETE FROM telegram_links WHERE chat_id = ? AND uuid != ?")) {
-                del.setLong(1, chatId);
-                del.setString(2, uuid.toString());
+            try (PreparedStatement del = connection.prepareStatement("DELETE FROM telegram_links WHERE uuid = ?")) {
+                del.setString(1, uuid.toString());
                 del.executeUpdate();
             }
-            try (PreparedStatement del = connection.prepareStatement(
-                    "DELETE FROM telegram_links WHERE uuid = ?")) {
-                del.setString(1, uuid.toString());
+            try (PreparedStatement del = connection.prepareStatement("DELETE FROM telegram_links WHERE chat_id = ?")) {
+                del.setLong(1, chatId);
                 del.executeUpdate();
             }
             try (PreparedStatement ps = connection.prepareStatement(
@@ -259,8 +302,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     }
 
     public boolean unlinkTelegram(UUID uuid) {
-        try (PreparedStatement ps = connection.prepareStatement(
-                "DELETE FROM telegram_links WHERE uuid = ?")) {
+        try (PreparedStatement ps = connection.prepareStatement("DELETE FROM telegram_links WHERE uuid = ?")) {
             ps.setString(1, uuid.toString());
             return ps.executeUpdate() > 0;
         } catch (SQLException e) {
@@ -270,8 +312,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     }
 
     public boolean unregisterUser(UUID uuid) {
-        try (PreparedStatement ps = connection.prepareStatement(
-                "DELETE FROM users WHERE uuid = ?")) {
+        try (PreparedStatement ps = connection.prepareStatement("DELETE FROM users WHERE uuid = ?")) {
             ps.setString(1, uuid.toString());
             boolean removed = ps.executeUpdate() > 0;
             if (removed) unlinkTelegram(uuid);
@@ -283,15 +324,23 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     }
 
     public String handleTelegramLink(String code, long chatId) {
-        UUID uuid = linkCodes.remove(code.toUpperCase());
-        if (uuid == null) {
+        String upper = code.toUpperCase();
+        Long expiry = linkCodeExpiry.remove(upper);
+        UUID uuid = linkCodes.remove(upper);
+        if (uuid == null || expiry == null || expiry < System.currentTimeMillis()) {
             return "Неверный или устаревший код. Возьми новый код в игре командой /link.";
         }
         saveTelegramLink(uuid, chatId);
         Player player = Bukkit.getPlayer(uuid);
         if (player != null && player.isOnline()) {
             player.sendMessage(msg(player, "telegram-linked"));
+            if (isAuthenticated(player) && !isInGame(player)) {
+                grantGameAccess(player);
+                player.sendMessage(msg(player, "auth-success"));
+                log("Granted game access after TG link: uuid=" + uuid + " name=" + player.getName());
+            }
         }
+        log("Telegram linked: uuid=" + uuid + " chatId=" + chatId);
         return "Аккаунт успешно привязан!";
     }
 
@@ -300,8 +349,9 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         if (uuid == null) {
             return "Этот Telegram-аккаунт не привязан ни к одному Minecraft-аккаунту. Используй /link в игре.";
         }
-        if (newPassword == null || newPassword.isEmpty()) {
-            return "Пароль не может быть пустым.";
+        int minLen = getConfig().getInt("min-password-length", 4);
+        if (newPassword == null || newPassword.length() < minLen) {
+            return "Пароль должен быть не короче " + minLen + " символов.";
         }
         String salt = generateSalt();
         String hash = hashPassword(newPassword, salt);
@@ -315,10 +365,10 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
                 player.sendMessage(msg(player, "password-changed-not-auth"));
             }
         }
+        log("Password changed via Telegram: uuid=" + uuid);
         return "Пароль успешно изменён! Зайди в игру и используй /login <новый пароль>.";
     }
 
-    // ========== ХЕШ ==========
     private String generateSalt() {
         byte[] salt = new byte[16];
         RANDOM.nextBytes(salt);
@@ -336,7 +386,6 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         return hashPassword(password, salt).equals(hash);
     }
 
-    // ========== ЯЗЫКИ ==========
     private Map<String, String> getBuiltinEnglish() {
         Map<String, String> m = new HashMap<>();
         m.put("language-name", "English");
@@ -353,6 +402,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         m.put("wrong-password", "§cWrong password.");
         m.put("passwords-dont-match", "§cPasswords do not match.");
         m.put("empty-password", "§cPassword cannot be empty.");
+        m.put("password-too-short", "§cPassword is too short. Minimum length: {min}");
         m.put("already-registered", "§cYou are already registered.");
         m.put("not-registered", "§cYou are not registered.");
         m.put("command-denied", "§cThis command is unavailable before authentication.");
@@ -385,17 +435,20 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         m.put("telegram-link-code", "§eSend to bot @{bot}: ");
         m.put("telegram-linked", "§aTelegram successfully linked!");
         m.put("telegram-already-linked", "§cYour Telegram is already linked.");
-        m.put("telegram-hint", "§eTip: link Telegram to §f{bot}§e with §f/link§e — you can reset your password via bot.");
+        m.put("telegram-hint", "§eTip: link Telegram with §f/link§e to reset password via bot.");
         m.put("password-changed-online", "§aPassword changed via Telegram. Use it on your next login.");
         m.put("password-changed-not-auth", "§aPassword changed via Telegram. Use it to log in.");
         m.put("telegram-required", "§cYou must link your Telegram account to play. Use §f/link§c.");
+        m.put("telegram-required-how", "§7Open the bot §f@{bot}§7, send §f/start <code>§7. Get the code with §f/link§7.");
         m.put("telegram-unlinked", "§aTelegram successfully unlinked!");
         m.put("telegram-not-linked", "§cYour Telegram is not linked.");
-        m.put("unreg-denied", "§cYou don't have permission to use this command.");
+        m.put("link-denied-not-auth", "§cYou must log in first before linking Telegram.");
+        m.put("unreg-denied", "§cYou don't have permission to unregister other players.");
         m.put("unreg-not-found", "§cPlayer not found.");
         m.put("unreg-not-registered", "§cThis player is not registered.");
+        m.put("unreg-self-success", "§aYour account has been removed from the database.");
         m.put("unreg-success", "§aPlayer §f{player}§a has been unregistered.");
-        m.put("unreg-kicked", "§cYour account was unregistered by an admin.");
+        m.put("unreg-kicked", "§cYour account has been removed from the database.");
         return m;
     }
 
@@ -415,6 +468,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         m.put("wrong-password", "§cНеверный пароль.");
         m.put("passwords-dont-match", "§cПароли не совпадают.");
         m.put("empty-password", "§cПароль не может быть пустым.");
+        m.put("password-too-short", "§cПароль слишком короткий. Минимум: {min}");
         m.put("already-registered", "§cВы уже зарегистрированы.");
         m.put("not-registered", "§cВы не зарегистрированы.");
         m.put("command-denied", "§cЭта команда недоступна до авторизации.");
@@ -447,17 +501,20 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         m.put("telegram-link-code", "§eОтправь боту @{bot}: ");
         m.put("telegram-linked", "§aTelegram успешно привязан!");
         m.put("telegram-already-linked", "§cТвой Telegram уже привязан.");
-        m.put("telegram-hint", "§eСовет: привяжи Telegram боту §f{bot}§e командой §f/link§e — сможешь сбрасывать пароль через бота.");
+        m.put("telegram-hint", "§eСовет: привяжи Telegram командой §f/link§e — сможешь сбрасывать пароль через бота.");
         m.put("password-changed-online", "§aПароль изменён через Telegram. Используй его при следующем входе.");
         m.put("password-changed-not-auth", "§aПароль изменён через Telegram. Используй его для входа.");
         m.put("telegram-required", "§cТы должен привязать Telegram, чтобы играть. Используй §f/link§c.");
+        m.put("telegram-required-how", "§7Открой бота §f@{bot}§7 и отправь §f/start <код>§7. Код получи командой §f/link§7.");
         m.put("telegram-unlinked", "§aTelegram успешно отвязан!");
         m.put("telegram-not-linked", "§cТвой Telegram не привязан.");
-        m.put("unreg-denied", "§cУ тебя нет прав на эту команду.");
+        m.put("link-denied-not-auth", "§cСначала войди в аккаунт, потом привязывай Telegram.");
+        m.put("unreg-denied", "§cУ тебя нет прав удалять других игроков.");
         m.put("unreg-not-found", "§cИгрок не найден.");
         m.put("unreg-not-registered", "§cЭтот игрок не зарегистрирован.");
+        m.put("unreg-self-success", "§aТвой аккаунт удалён из базы данных.");
         m.put("unreg-success", "§aИгрок §f{player}§a удалён из базы.");
-        m.put("unreg-kicked", "§cТвой аккаунт удалён администратором.");
+        m.put("unreg-kicked", "§cТвой аккаунт удалён из базы данных.");
         return m;
     }
 
@@ -545,7 +602,6 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         return languageNames.getOrDefault(code, code);
     }
 
-    // ========== ДИАЛОГ ==========
     private void showDialog(Player player, boolean isRegistration) {
         DialogBase.Builder baseBuilder = DialogBase.builder(Component.text(isRegistration ? "Регистрация" : "Авторизация"))
                 .canCloseWithEscape(false)
@@ -598,6 +654,10 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         return authenticated.getOrDefault(player.getUniqueId(), false);
     }
 
+    public boolean isInGame(Player player) {
+        return inGame.getOrDefault(player.getUniqueId(), false);
+    }
+
     public void showDialogForPlayer(Player player) {
         showDialog(player, !isRegistered(player.getUniqueId()));
     }
@@ -614,14 +674,15 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         }
         telegramBot.sendMessage(chatId, "Сброс пароля. Отправь боту команду:\n/newpass <новый_пароль>");
         player.sendMessage(msg(player, "reset-tg-sent"));
+        log("Password reset requested: uuid=" + player.getUniqueId() + " name=" + player.getName());
     }
 
-    // ========== СОБЫТИЯ ==========
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         UUID uuid = player.getUniqueId();
         authenticated.put(uuid, false);
+        inGame.put(uuid, false);
         preAuthLocations.put(uuid, player.getLocation().clone());
 
         if (getConfig().getString("spawn-mode", "DEFAULT").equalsIgnoreCase("FIXED")) {
@@ -637,24 +698,32 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
             player.sendMessage(msg(player, "chat-instruction-login"));
         }
 
-        if (getTelegramChatId(uuid) == null && !telegramHintShown.contains(uuid)) {
-            telegramHintShown.add(uuid);
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                if (player.isOnline()) {
-                    String botUsername = getConfig().getString("telegram.bot-username", "MeowAuthBot");
-                    String hintText = msg(player, "telegram-hint").replace("{bot}", "@" + botUsername);
-                    player.sendMessage(Component.text(hintText)
-                            .append(Component.text(" §a§l[/link]")
-                                    .clickEvent(ClickEvent.copyToClipboard("/link"))
-                                    .hoverEvent(HoverEvent.showText(Component.text("§7Нажми, чтобы скопировать команду")))));
+        int hintEvery = getConfig().getInt("telegram-hint-every", 3);
+        if (hintEvery > 0 && isRegistered(uuid)) {
+            if (getTelegramChatId(uuid) == null) {
+                int count = getJoinCount(uuid) + 1;
+                incrementJoinCount(uuid);
+                if (count % hintEvery == 0) {
+                    Bukkit.getScheduler().runTaskLater(this, () -> {
+                        if (player.isOnline()) {
+                            String botUsername = getConfig().getString("telegram.bot-username", "MeowAuthBot");
+                            String hintText = msg(player, "telegram-hint").replace("{bot}", "@" + botUsername);
+                            player.sendMessage(Component.text(hintText)
+                                    .append(Component.text(" §a§l[/link]")
+                                            .clickEvent(ClickEvent.copyToClipboard("/link"))
+                                            .hoverEvent(HoverEvent.showText(Component.text("§7Нажми, чтобы скопировать команду")))));
+                        }
+                    }, 60L);
                 }
-            }, 60L);
+            } else {
+                incrementJoinCount(uuid);
+            }
         }
 
         int timeout = getConfig().getInt("auth-timeout", 120);
         if (timeout > 0) {
             kickTasks.put(uuid, getServer().getScheduler().runTaskLater(this, () -> {
-                if (!isAuthenticated(player)) player.kick(Component.text(msg(player, "timeout-kick")));
+                if (!isInGame(player)) player.kick(Component.text(msg(player, "timeout-kick")));
             }, timeout * 20L));
         }
     }
@@ -663,9 +732,9 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     public void onQuit(PlayerQuitEvent event) {
         UUID uuid = event.getPlayer().getUniqueId();
         authenticated.remove(uuid);
+        inGame.remove(uuid);
         preAuthLocations.remove(uuid);
         playerLanguages.remove(uuid);
-        telegramHintShown.remove(uuid);
         BukkitTask task = kickTasks.remove(uuid);
         if (task != null) task.cancel();
     }
@@ -693,7 +762,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
             setAuthMode(player.getUniqueId(), "CHAT");
             player.closeDialog();
             player.sendMessage(msg(player, "mode-switched-to-chat"));
-            if (!isAuthenticated(player)) {
+            if (!isInGame(player)) {
                 player.sendMessage(msg(player, isRegistered(player.getUniqueId()) ? "chat-instruction-login" : "chat-instruction-register"));
             }
             return;
@@ -729,12 +798,17 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
                     showDialog(player, true);
                     return;
                 }
+                int minLen = getConfig().getInt("min-password-length", 4);
+                if (password.length() < minLen) {
+                    player.sendMessage(msg(player, "password-too-short").replace("{min}", String.valueOf(minLen)));
+                    showDialog(player, true);
+                    return;
+                }
                 handleRegister(player, password);
             }
         }
     }
 
-    // ========== ЛОГИН / РЕГИСТРАЦИЯ ==========
     private void handleLogin(Player player, String password) {
         if (isAuthenticated(player)) {
             player.sendMessage(msg(player, "already-authenticated"));
@@ -751,6 +825,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
             onAuthSuccess(player, false);
         } else {
             player.sendMessage(msg(player, "wrong-password"));
+            log("Failed login: uuid=" + uuid + " name=" + player.getName());
             if ("DIALOG".equals(getAuthMode(uuid))) showDialog(player, false);
         }
     }
@@ -765,32 +840,47 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
             player.sendMessage(msg(player, "already-registered"));
             return;
         }
+        int minLen = getConfig().getInt("min-password-length", 4);
+        if (password.length() < minLen) {
+            player.sendMessage(msg(player, "password-too-short").replace("{min}", String.valueOf(minLen)));
+            return;
+        }
         String salt = generateSalt();
         String hash = hashPassword(password, salt);
         registerUser(uuid, hash, salt, "DIALOG");
         player.sendMessage(msg(player, "register-success"));
+        log("Registered: uuid=" + uuid + " name=" + player.getName());
         onAuthSuccess(player, true);
     }
 
     private void onAuthSuccess(Player player, boolean fromRegistration) {
         UUID uuid = player.getUniqueId();
+        authenticated.put(uuid, true);
 
         if (getConfig().getBoolean("require-telegram-link", false)
                 && getTelegramChatId(uuid) == null) {
             player.sendMessage(msg(player, "telegram-required"));
+            String botUsername = getConfig().getString("telegram.bot-username", "MeowAuthBot");
+            player.sendMessage(msg(player, "telegram-required-how").replace("{bot}", "@" + botUsername));
+            log("Authenticated, awaiting TG link: uuid=" + uuid + " name=" + player.getName());
             return;
         }
 
-        authenticated.put(uuid, true);
+        grantGameAccess(player);
+        if (!fromRegistration) player.sendMessage(msg(player, "auth-success"));
+        log("Logged in: uuid=" + uuid + " name=" + player.getName());
+    }
+
+    private void grantGameAccess(Player player) {
+        UUID uuid = player.getUniqueId();
+        inGame.put(uuid, true);
         player.setInvisible(false);
         Location saved = preAuthLocations.remove(uuid);
         if (saved != null) player.teleport(saved);
         BukkitTask task = kickTasks.remove(uuid);
         if (task != null) task.cancel();
-        if (!fromRegistration) player.sendMessage(msg(player, "auth-success"));
     }
 
-    // ========== КОМАНДЫ ==========
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (!(sender instanceof Player player)) {
@@ -805,12 +895,17 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         }
 
         if (cmd.equals("link")) {
+            if (!isAuthenticated(player)) {
+                player.sendMessage(msg(player, "link-denied-not-auth"));
+                return true;
+            }
             if (getTelegramChatId(player.getUniqueId()) != null) {
                 player.sendMessage(msg(player, "telegram-already-linked"));
                 return true;
             }
             String code = generateLinkCode();
             linkCodes.put(code, player.getUniqueId());
+            linkCodeExpiry.put(code, System.currentTimeMillis() + LINK_CODE_TTL_MS);
             String botUsername = getConfig().getString("telegram.bot-username", "MeowAuthBot");
             String tgCommand = "/start " + code;
 
@@ -822,8 +917,13 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         }
 
         if (cmd.equals("unlink")) {
+            if (!isAuthenticated(player)) {
+                player.sendMessage(msg(player, "link-denied-not-auth"));
+                return true;
+            }
             if (unlinkTelegram(player.getUniqueId())) {
                 player.sendMessage(msg(player, "telegram-unlinked"));
+                log("Telegram unlinked by player: uuid=" + player.getUniqueId() + " name=" + player.getName());
             } else {
                 player.sendMessage(msg(player, "telegram-not-linked"));
             }
@@ -831,14 +931,32 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
         }
 
         if (cmd.equals("unreg")) {
-            if (!player.hasPermission("meowlogin.unreg") && !player.isOp()) {
+            boolean hasAdminPerm = player.hasPermission("meowlogin.unreg") || player.isOp();
+
+            if (args.length < 1) {
+                if (hasAdminPerm) {
+                    player.sendMessage("§cИспользование: /unreg <игрок>");
+                    return true;
+                }
+                UUID selfUuid = player.getUniqueId();
+                if (!isRegistered(selfUuid)) {
+                    player.sendMessage(msg(player, "unreg-not-registered"));
+                    return true;
+                }
+                if (unregisterUser(selfUuid)) {
+                    log("Self-unregister: uuid=" + selfUuid + " name=" + player.getName());
+                    player.kick(Component.text(msg(player, "unreg-kicked")));
+                } else {
+                    player.sendMessage("§cНе удалось удалить аккаунт.");
+                }
+                return true;
+            }
+
+            if (!hasAdminPerm) {
                 player.sendMessage(msg(player, "unreg-denied"));
                 return true;
             }
-            if (args.length < 1) {
-                player.sendMessage("§cИспользование: /unreg <игрок>");
-                return true;
-            }
+
             Player target = Bukkit.getPlayerExact(args[0]);
             UUID targetUuid = null;
             String targetName = args[0];
@@ -866,6 +984,8 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
 
             if (unregisterUser(targetUuid)) {
                 player.sendMessage(msg(player, "unreg-success").replace("{player}", targetName));
+                log("Admin " + player.getName() + " (" + player.getUniqueId() + ") unregistered " +
+                        targetName + " (" + targetUuid + ")");
                 if (target != null && target.isOnline()) {
                     target.kick(Component.text(msg(target, "unreg-kicked")));
                 }
@@ -915,24 +1035,24 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
 
             if (args.length == 1 && args[0].equalsIgnoreCase("mode")) {
                 String currentMode = getAuthMode(player.getUniqueId());
-                boolean isAuthed = isAuthenticated(player);
+                boolean authed = isAuthenticated(player);
 
                 if (currentMode == null) {
                     setAuthMode(player.getUniqueId(), "CHAT");
                     player.closeDialog();
                     player.sendMessage(msg(player, "mode-switched-to-chat"));
-                    if (!isAuthed) player.sendMessage(msg(player, "chat-instruction-register"));
+                    if (!authed) player.sendMessage(msg(player, "chat-instruction-register"));
                     return true;
                 }
                 if (currentMode.equals("DIALOG")) {
                     setAuthMode(player.getUniqueId(), "CHAT");
                     player.closeDialog();
                     player.sendMessage(msg(player, "mode-switched-to-chat"));
-                    if (!isAuthed) player.sendMessage(msg(player, "chat-instruction-login"));
+                    if (!authed) player.sendMessage(msg(player, "chat-instruction-login"));
                 } else {
                     setAuthMode(player.getUniqueId(), "DIALOG");
                     player.sendMessage(msg(player, "mode-switched-to-dialog"));
-                    if (!isAuthed) showDialogForPlayer(player);
+                    if (!authed) showDialogForPlayer(player);
                 }
                 return true;
             }
@@ -961,7 +1081,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
                 defaultLang = getConfig().getString("default-language", "en");
                 loadAllLanguages();
                 player.sendMessage(msg(player, "reload-success") + languages.size());
-                getLogger().info("Config and languages reloaded by " + player.getName() + ". Languages: " + languages.keySet());
+                log("Config reloaded by " + player.getName());
                 return true;
             }
 
@@ -974,16 +1094,15 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     private String generateLinkCode() {
         String chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < 8; i++) {
-            sb.append(chars.charAt(RANDOM.nextInt(chars.length())));
-        }
+        for (int i = 0; i < 8; i++) sb.append(chars.charAt(RANDOM.nextInt(chars.length())));
         return sb.toString();
     }
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
-        if (!(sender instanceof Player)) return Collections.emptyList();
+        if (!(sender instanceof Player player)) return Collections.emptyList();
         String name = command.getName().toLowerCase();
+
         if (name.equals("meowlogin") || name.equals("ml")) {
             if (args.length == 1) {
                 return List.of("mode", "lang", "reload").stream()
@@ -996,22 +1115,26 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
                         .toList();
             }
         }
+
         if (name.equals("unreg")) {
             if (args.length == 1) {
+                if (!player.hasPermission("meowlogin.unreg") && !player.isOp()) {
+                    return Collections.emptyList();
+                }
                 return Bukkit.getOnlinePlayers().stream()
                         .map(Player::getName)
                         .filter(s -> s.toLowerCase().startsWith(args[0].toLowerCase()))
                         .toList();
             }
         }
+
         return Collections.emptyList();
     }
 
-    // ========== БЛОКИРОВКИ ==========
     @EventHandler(priority = EventPriority.LOWEST)
     public void onMove(PlayerMoveEvent event) {
         Player player = event.getPlayer();
-        if (isAuthenticated(player)) return;
+        if (isInGame(player)) return;
         if (!getConfig().getBoolean("block.movement", true)) return;
 
         if (event.getFrom().getX() != event.getTo().getX() ||
@@ -1026,7 +1149,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
 
     @EventHandler
     public void onChat(AsyncPlayerChatEvent event) {
-        if (!isAuthenticated(event.getPlayer()) && getConfig().getBoolean("block.chat", true)) {
+        if (!isInGame(event.getPlayer()) && getConfig().getBoolean("block.chat", true)) {
             event.setCancelled(true);
             event.getPlayer().sendMessage(msg(event.getPlayer(), "chat-denied"));
         }
@@ -1035,21 +1158,34 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     @EventHandler
     public void onCommandPreprocess(PlayerCommandPreprocessEvent event) {
         Player player = event.getPlayer();
-        boolean needsTgLink = getConfig().getBoolean("require-telegram-link", false)
-                && getTelegramChatId(player.getUniqueId()) == null;
 
-        if (isAuthenticated(player) && !needsTgLink) return;
+        if (isInGame(player)) return;
 
+        boolean auth = isAuthenticated(player);
         String message = event.getMessage().toLowerCase(Locale.ROOT);
-        boolean allowed = message.equals("/meowlogin") || message.startsWith("/meowlogin ") ||
-                message.equals("/ml") || message.startsWith("/ml ") ||
-                message.equals("/l") || message.startsWith("/l ") ||
-                message.equals("/login") || message.startsWith("/login ") ||
-                message.equals("/reg") || message.startsWith("/reg ") ||
-                message.equals("/register") || message.startsWith("/register ") ||
-                message.equals("/resetpassword") ||
-                message.equals("/link") ||
-                message.equals("/unlink");
+        boolean allowed;
+
+        if (!auth) {
+            allowed = message.equals("/meowlogin") || message.startsWith("/meowlogin ") ||
+                    message.equals("/ml") || message.startsWith("/ml ") ||
+                    message.equals("/l") || message.startsWith("/l ") ||
+                    message.equals("/login") || message.startsWith("/login ") ||
+                    message.equals("/reg") || message.startsWith("/reg ") ||
+                    message.equals("/register") || message.startsWith("/register ") ||
+                    message.equals("/resetpassword");
+        } else {
+            allowed = message.equals("/meowlogin") || message.startsWith("/meowlogin ") ||
+                    message.equals("/ml") || message.startsWith("/ml ") ||
+                    message.equals("/l") || message.startsWith("/l ") ||
+                    message.equals("/login") || message.startsWith("/login ") ||
+                    message.equals("/reg") || message.startsWith("/reg ") ||
+                    message.equals("/register") || message.startsWith("/register ") ||
+                    message.equals("/resetpassword") ||
+                    message.equals("/link") || message.startsWith("/link ") ||
+                    message.equals("/unlink") || message.startsWith("/unlink ") ||
+                    message.equals("/unreg") || message.startsWith("/unreg ");
+        }
+
         if (!allowed) {
             event.setCancelled(true);
             player.sendMessage(msg(player, "command-denied"));
@@ -1059,7 +1195,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     @EventHandler
     public void onInteract(PlayerInteractEvent event) {
         Player player = event.getPlayer();
-        if (isAuthenticated(player)) return;
+        if (isInGame(player)) return;
         if (!getConfig().getBoolean("block.interact", true)) return;
 
         if (event.getAction() == Action.RIGHT_CLICK_BLOCK ||
@@ -1071,60 +1207,60 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
 
     @EventHandler
     public void onInteractEntity(PlayerInteractEntityEvent event) {
-        if (!isAuthenticated(event.getPlayer()) && getConfig().getBoolean("block.interact-entity", true)) {
+        if (!isInGame(event.getPlayer()) && getConfig().getBoolean("block.interact-entity", true)) {
             event.setCancelled(true);
         }
     }
 
     @EventHandler
     public void onBlockBreak(BlockBreakEvent event) {
-        if (!isAuthenticated(event.getPlayer()) && getConfig().getBoolean("block.block-break", true)) event.setCancelled(true);
+        if (!isInGame(event.getPlayer()) && getConfig().getBoolean("block.block-break", true)) event.setCancelled(true);
     }
 
     @EventHandler
     public void onBlockPlace(BlockPlaceEvent event) {
-        if (!isAuthenticated(event.getPlayer()) && getConfig().getBoolean("block.block-place", true)) event.setCancelled(true);
+        if (!isInGame(event.getPlayer()) && getConfig().getBoolean("block.block-place", true)) event.setCancelled(true);
     }
 
     @EventHandler
     public void onDrop(PlayerDropItemEvent event) {
-        if (!isAuthenticated(event.getPlayer()) && getConfig().getBoolean("block.item-drop", true)) event.setCancelled(true);
+        if (!isInGame(event.getPlayer()) && getConfig().getBoolean("block.item-drop", true)) event.setCancelled(true);
     }
 
     @EventHandler
     public void onPickup(EntityPickupItemEvent event) {
-        if (event.getEntity() instanceof Player player && !isAuthenticated(player) && getConfig().getBoolean("block.item-pickup", true)) event.setCancelled(true);
+        if (event.getEntity() instanceof Player player && !isInGame(player) && getConfig().getBoolean("block.item-pickup", true)) event.setCancelled(true);
     }
 
     @EventHandler
     public void onDamage(EntityDamageByEntityEvent event) {
         if (!getConfig().getBoolean("block.damage", true)) return;
-        if (event.getDamager() instanceof Player player && !isAuthenticated(player)) event.setCancelled(true);
-        if (event.getEntity() instanceof Player player && !isAuthenticated(player)) event.setCancelled(true);
+        if (event.getDamager() instanceof Player player && !isInGame(player)) event.setCancelled(true);
+        if (event.getEntity() instanceof Player player && !isInGame(player)) event.setCancelled(true);
     }
 
     @EventHandler
     public void onMobTarget(EntityTargetLivingEntityEvent event) {
         if (!getConfig().getBoolean("block.mob-target", true)) return;
-        if (event.getTarget() instanceof Player player && !isAuthenticated(player)) event.setCancelled(true);
+        if (event.getTarget() instanceof Player player && !isInGame(player)) event.setCancelled(true);
     }
 
     @EventHandler
     public void onInventoryClick(InventoryClickEvent event) {
-        if (event.getWhoClicked() instanceof Player player && !isAuthenticated(player)) event.setCancelled(true);
+        if (event.getWhoClicked() instanceof Player player && !isInGame(player)) event.setCancelled(true);
     }
 
     @EventHandler
     public void onGameModeChange(PlayerGameModeChangeEvent event) {
         Player player = event.getPlayer();
-        if (isAuthenticated(player)) return;
+        if (isInGame(player)) return;
         if (!getConfig().getBoolean("block.gamemode-change", true)) return;
         event.setCancelled(true);
     }
 
     @EventHandler
     public void onToggleFlight(PlayerToggleFlightEvent event) {
-        if (isAuthenticated(event.getPlayer())) return;
+        if (isInGame(event.getPlayer())) return;
         if (!getConfig().getBoolean("block.flight", true)) return;
         event.setCancelled(true);
     }
@@ -1132,7 +1268,7 @@ public class MeowLogIn extends JavaPlugin implements Listener, CommandExecutor, 
     @EventHandler
     public void onDamageAny(EntityDamageEvent event) {
         if (!(event.getEntity() instanceof Player player)) return;
-        if (isAuthenticated(player)) return;
+        if (isInGame(player)) return;
         if (!getConfig().getBoolean("block.damage", true)) return;
         event.setCancelled(true);
     }
